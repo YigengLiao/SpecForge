@@ -128,10 +128,35 @@ def parse_arguments():
         help="Mapped to presence_penalty in the OpenAI API",
     )
     sampling_params_group.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Whole-conversation ceiling in tokens. A record whose prompt + completion "
+            "crosses it on any turn is DISCARDED ENTIRELY, not stored cut off. Unset "
+            "disables the check. This is not --max-tokens: that one caps generation, "
+            "this one rejects the record."
+        ),
+    )
+    sampling_params_group.add_argument(
+        "--request-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Per-request HTTP timeout in seconds. Unset uses the openai library default, "
+            "which is reached at high concurrency once requests queue: a timeout there "
+            "discards a generation the server has already produced."
+        ),
+    )
+    sampling_params_group.add_argument(
         "--max-tokens",
         type=int,
-        default=4096,
-        help="Maximum number of tokens (default: 4096)",
+        default=None,
+        help=(
+            "Maximum tokens to generate. Omitted from the request when unset, letting "
+            "the server allocate what the context has left after each prompt instead of "
+            "applying one constant to every record. Set it only to cap below that."
+        ),
     )
 
     # optimization
@@ -222,10 +247,11 @@ def build_query_kwargs(args, messages, max_tokens=None):
     query_kwargs = dict(
         model=args.model,
         messages=query_messages,
-        max_tokens=effective_max_tokens,
         temperature=args.temperature,
         stream=False,
     )
+    if effective_max_tokens is not None:
+        query_kwargs["max_tokens"] = effective_max_tokens
     if args.top_p is not None:
         query_kwargs["top_p"] = args.top_p
     if args.repetition_penalty is not None:
@@ -256,7 +282,11 @@ def call_sglang(
             "dataset regeneration requires the OpenAI client; install "
             "SpecForge's data extra with `pip install 'specforge[data]'`"
         ) from _OPENAI_IMPORT_ERROR
-    client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
+    client = OpenAI(
+        base_url=f"http://{server_address}/v1",
+        api_key="None",
+        timeout=args.request_timeout,
+    )
 
     messages = data["conversations"]
     regenerated_messages = []
@@ -283,6 +313,36 @@ def call_sglang(
                 data["status"] = "error"
                 data["error"] = str(e)
                 return data
+
+            if max_tokens is None:
+                finish_reason = resp.choices[0].finish_reason
+                if finish_reason != "stop":
+                    return set_skipped(
+                        data,
+                        f"[budget] incomplete generation: finish_reason="
+                        f"{finish_reason!r} instead of 'stop', so this turn was cut off "
+                        f"rather than finished; discarding the whole conversation",
+                    )
+                if args.max_total_tokens is not None:
+                    usage = getattr(resp, "usage", None)
+                    if usage is None:
+                        data["status"] = "error"
+                        data["error"] = (
+                            "--max-total-tokens is set but the response carried no usage "
+                            "block, so the budget could not be checked; refusing to "
+                            "store the record on an unchecked assumption"
+                        )
+                        return data
+                    total_tokens = usage.prompt_tokens + usage.completion_tokens
+                    if total_tokens > args.max_total_tokens:
+                        return set_skipped(
+                            data,
+                            f"[budget] over the conversation ceiling: prompt "
+                            f"{usage.prompt_tokens} + completion "
+                            f"{usage.completion_tokens} = {total_tokens} > "
+                            f"{args.max_total_tokens}; discarding the whole conversation",
+                        )
+
             response_text = resp.choices[0].message.content
             if args.reasoning == "disable" and (
                 not isinstance(response_text, str)
@@ -343,12 +403,18 @@ def main():
     if not (0.0 <= args.temperature <= 1.0):
         raise ValueError("Temperature must be between 0.0 and 1.0")
 
-    if args.max_tokens <= 0:
+    if args.max_tokens is not None and args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
+
+    if args.max_total_tokens is not None and args.max_total_tokens <= 0:
+        raise ValueError(
+            f"Max total tokens must be greater than 0, got {args.max_total_tokens}"
+        )
 
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Max tokens: {args.max_tokens}")
+    print(f"  Max total tokens: {args.max_total_tokens}")
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Temperature: {args.temperature}")
     print(f"  API URL: {args.server_address}")
