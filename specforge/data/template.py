@@ -308,6 +308,20 @@ TEMPLATE_REGISTRY.register(
 )
 
 TEMPLATE_REGISTRY.register(
+    name="glm-5.2-thinking",
+    template=ChatTemplate(
+        assistant_header="<|assistant|><think>",
+        user_header="<|user|>",
+        system_prompt=None,
+        end_of_turn_token="<|user|>",
+        parser_type="glm",
+        assistant_pattern_type="glm",
+        ignore_token=["<|user|>"],
+        enable_thinking=True,
+    ),
+)
+
+TEMPLATE_REGISTRY.register(
     name="gemma",
     template=ChatTemplate(
         assistant_header="<start_of_turn>model\n",

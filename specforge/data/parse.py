@@ -507,9 +507,9 @@ class ThinkingParser(GeneralParser):
         )
 
 
-class GLMParser(GeneralParser):
+class GLMParser(ThinkingParser):
     """Render GLM-5.2's hybrid-thinking template consistently for training."""
 
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
-        kwargs.setdefault("enable_thinking", False)
+        kwargs.setdefault("enable_thinking", bool(self.chat_template.enable_thinking))
         return super().apply_chat_template(messages, tool, **kwargs)
