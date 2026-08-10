@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch._dynamo as dynamo
 from torch.nn.attention.flex_attention import (
@@ -8,6 +10,10 @@ from torch.nn.attention.flex_attention import (
 from transformers.utils import is_torchdynamo_compiling
 
 dynamo.config.recompile_limit = 64
+
+# DEPRECATED, leave at 0: skipping the compile turns a NoValidChoicesError into a silent
+# eager fallback whose attention memory is quadratic in length -- six OOMs on 2026-08-09.
+_FLEX_EAGER = os.environ.get("SPECFORGE_FLEX_EAGER", "0") not in ("0", "", "false", "False")
 
 
 # Reference Implementation https://github.com/huggingface/transformers/blob/main/src/transformers/integrations/flex_attention.py
@@ -33,9 +39,13 @@ class WrappedFlexAttention:
         """
         if not self._is_flex_compiled:
             # Enable dynamic shapes to handle different input sizes
-            self._compiled_flex_attention = torch.compile(
-                flex_attention,
-                # mode="max-autotune-no-cudagraphs",
+            self._compiled_flex_attention = (
+                flex_attention
+                if _FLEX_EAGER
+                else torch.compile(
+                    flex_attention,
+                    # mode="max-autotune-no-cudagraphs",
+                )
             )
             self._is_flex_compiled = True
 
@@ -75,7 +85,9 @@ class WrappedCreateBlockMask:
     @torch.compiler.disable(recursive=False)
     def __init__(self):
         if not self._is_create_block_mask_compiled:
-            self._compiled_create_block_mask = torch.compile(create_block_mask)
+            self._compiled_create_block_mask = (
+                create_block_mask if _FLEX_EAGER else torch.compile(create_block_mask)
+            )
             self._is_create_block_mask_compiled = True
 
     def __call__(self):
