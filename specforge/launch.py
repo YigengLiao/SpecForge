@@ -1191,6 +1191,18 @@ def build_disagg_online_producer(
                 prompt_epochs,
                 seed=prompt_seed,
             )
+            # A cold-restarted producer has no resume state and would replay every
+            # already-trained prompt through the target forward (~3 h for a 192-step gap).
+            import os as _os
+
+            skip = int(_os.environ.get("SF_PRODUCER_SKIP_PROMPTS", "0") or 0)
+            if epoch == 0 and skip > 0:
+                dropped = min(skip, len(epoch_prompts))
+                epoch_prompts = epoch_prompts[dropped:]
+                producer_timing(
+                    f"resume skip: dropped {dropped} already-trained prompts "
+                    f"from epoch 1, {len(epoch_prompts)} remain"
+                )
             epoch_count = (
                 len(epoch_prompts) if hasattr(epoch_prompts, "__len__") else "unknown"
             )
