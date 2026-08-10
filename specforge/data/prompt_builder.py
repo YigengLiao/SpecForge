@@ -175,7 +175,7 @@ def _materialize_prompt_tasks(
 
         input_ids = input_ids[:max_length]
         loss_mask = loss_mask[:max_length]
-        if sum(loss_mask) < min_loss_tokens:
+        if _count_supervised(loss_mask) < min_loss_tokens:
             continue
 
         prompts.append(
@@ -202,6 +202,9 @@ def _normalize_integer_sequence(
     # per epoch, and a Python int costs ~36 bytes against an array cell's 4 (or 1).
     typed_source = hasattr(value, "tolist")
     if typed_source:
+        packed = _pack_integer_column(value, field=field, source=source, binary=binary)
+        if packed is not None:
+            return packed
         value = value.tolist()
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError(f"{source} field {field} must be a sequence")
@@ -243,6 +246,59 @@ def _normalize_integer_sequence(
             )
         normalized.append(integer)
     return array("b" if binary else "i", normalized)
+
+
+def _count_supervised(loss_mask: Any) -> int:
+    """Count the supervised positions, reading the mask's buffer rather than its elements.
+
+    Builtin sum() boxes every element: 1.81M rows x up to 4096 positions on the event
+    corpus. numpy reads the same bytes with no copy.
+    """
+    if isinstance(loss_mask, array) and loss_mask.typecode == "b":
+        try:
+            import numpy as np
+
+            return int(np.frombuffer(loss_mask, dtype=np.int8).sum())
+        except (ImportError, TypeError, ValueError):
+            pass
+    return sum(loss_mask)
+
+
+def _pack_integer_column(value: Any, *, field: str, source: str, binary: bool):
+    """Pack an integer numpy column into array.array, or return None if it is not one.
+
+    tolist() on a 4096-token row builds 4096 Python ints only for array() to unbox them
+    again. Measured on the 1.81M-row event corpus, that round trip was 674 s of the
+    producer's 744 s startup; going through the buffer skips it entirely.
+    """
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - numpy arrives with datasets
+        return None
+
+    column = np.asarray(value)
+    if column.ndim == 2 and column.shape[0] == 1:
+        column = column[0]
+    if column.ndim != 1 or not np.issubdtype(column.dtype, np.integer):
+        return None
+
+    if binary:
+        if column.size and (column.min() < 0 or column.max() > 1):
+            bad = int(column[(column != 0) & (column != 1)][0])
+            raise ValueError(f"{source} field {field} must be 0 or 1, got {bad}")
+        typecode, dtype = "b", np.int8
+    else:
+        limits = np.iinfo(np.int32)
+        if column.size and (column.min() < limits.min or column.max() > limits.max):
+            return None
+        typecode, dtype = "i", np.int32
+
+    packed = array(typecode)
+    # frombytes trusts the element width; a platform where they disagree takes the slow path.
+    if packed.itemsize != np.dtype(dtype).itemsize:
+        return None
+    packed.frombytes(np.ascontiguousarray(column, dtype=dtype).tobytes())
+    return packed
 
 
 def _is_sequence(value: Any) -> bool:
