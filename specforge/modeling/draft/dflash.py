@@ -124,6 +124,10 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if self.config._attn_implementation == "flex_attention":
+            # Under 64 query positions inductor finds no flex_decoding config and raises
+            # NoValidChoicesError; the main kernel compiles at every length we measured.
+            kwargs.setdefault("kernel_options", {"FORCE_USE_FLEX_ATTENTION": True})
         attn_output, attn_weights = attn_fn(
             self,
             q,
