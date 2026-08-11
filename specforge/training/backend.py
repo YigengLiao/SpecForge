@@ -252,10 +252,17 @@ class FSDPTrainingBackend(TrainingBackend):
                 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
                 sharding = getattr(ShardingStrategy, pc.sharding_strategy)
+                # reduce_dtype defaulted to param_dtype, so gradients accumulated and
+                # reduced in bf16 while the Adam moments and masters were already fp32.
+                reduce_dtype = getattr(
+                    torch, os.environ.get("SF_GRAD_REDUCE_DTYPE", "float32")
+                )
                 fsdp_kwargs = dict(
                     use_orig_params=True,
                     mixed_precision=MixedPrecision(
-                        param_dtype=pc.param_dtype, buffer_dtype=torch.float32
+                        param_dtype=pc.param_dtype,
+                        reduce_dtype=reduce_dtype,
+                        buffer_dtype=torch.float32,
                     ),
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
