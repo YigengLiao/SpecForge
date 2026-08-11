@@ -267,6 +267,10 @@ class FSDPTrainingBackend(TrainingBackend):
                     sharding_strategy=sharding,
                     process_group=pc.fsdp_process_group,
                 )
+                if pc.sharding_strategy in ("HYBRID_SHARD", "_HYBRID_SHARD_ZERO2"):
+                    # Hybrid wants a (shard, replicate) pair; dropping process_group lets
+                    # FSDP build both. grad-norm reduction keeps WORLD, it is global.
+                    fsdp_kwargs.pop("process_group", None)
                 if ignored_frozen_modules:
                     fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
                 if block_classes:

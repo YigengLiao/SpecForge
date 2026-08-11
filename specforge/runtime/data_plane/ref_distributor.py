@@ -156,6 +156,17 @@ class RefDistributor:
             StreamingRefChannel(self.inbox_path(inbox_dir, rank))
             for rank in range(dp_size)
         ]
+        # Node-affine dispatch keeps each feature fetch on the host that produced it.
+        # Off unless both env vars agree with dp_size; then this is plain round-robin.
+        self._nodes = 0
+        urls = (os.environ.get("SF_SERVER_URLS") or "").split()
+        want_nodes = int(os.environ.get("SF_DISPATCH_NNODES", "0") or 0)
+        if want_nodes > 1 and len(urls) == want_nodes and dp_size % want_nodes == 0:
+            self._nodes = want_nodes
+            self._ranks_per_node = dp_size // want_nodes
+            self._server_node = {url: index for index, url in enumerate(urls)}
+            self._node_windows: List[List[SampleRef]] = [[] for _ in range(want_nodes)]
+        self._unplaced = 0
         # Continue the producer-visible counter instead of rewinding it after a
         # consumer restart. A crash can occur after SQLite commit/feature abort
         # but before the rank-local inbox ack; repair that narrow window from
@@ -261,16 +272,25 @@ class RefDistributor:
                 # its full quantum secured could end mid-accumulation at
                 # end-of-stream, stranding refs no resume can ever settle.
                 # Once secured, the window completes within this same loop.
-                if len(self._window) + queue.depth() < self.dispatch_quantum:
+                buffered = sum(len(w) for w in self._node_windows) if self._nodes else 0
+                if len(self._window) + buffered + queue.depth() < self.dispatch_quantum:
                     break
             need = self.dispatch_round_quantum - len(self._window)
             if need:
                 self._window.extend(queue.get(need, timeout_s=0.0))
-            if len(self._window) < self.dispatch_round_quantum:
-                break
             rank_batches: List[List[SampleRef]] = [[] for _ in range(self.dp_size)]
-            for index, ref in enumerate(self._window):
-                rank_batches[index % self.dp_size].append(ref)
+            if self._nodes:
+                # Take whatever arrived: refs come in per-server bursts, so waiting for a
+                # full round in one gulp would leave the short node's bucket unfed.
+                maybe_batches = self._node_affine_batches()
+                if maybe_batches is None:
+                    break
+                rank_batches = maybe_batches
+            else:
+                if len(self._window) < self.dispatch_round_quantum:
+                    break
+                for index, ref in enumerate(self._window):
+                    rank_batches[index % self.dp_size].append(ref)
             for inbox, refs in zip(self._inboxes, rank_batches):
                 inbox.publish_batch(refs)
             self.stats["dispatched"] += self.dispatch_round_quantum
@@ -286,6 +306,35 @@ class RefDistributor:
         if source_drained:
             self._finish()
         return progress
+
+    def _node_affine_batches(self) -> Optional[List[List[SampleRef]]]:
+        """Deal one micro-batch round from per-node buckets, or None if a node is short.
+
+        A round spans every rank, so one slow capture server stalls it rather than being
+        covered by a peer's refs -- the cost of keeping each fetch on its producing host.
+        """
+        for ref in self._window:
+            node = self._server_node.get(str(ref.metadata.get("server", "")))
+            if node is None:
+                # Unknown origin: placed where it costs least and counted, so a renamed
+                # server URL shows up in _unplaced instead of as silent cross-host traffic.
+                node = min(range(self._nodes), key=lambda i: len(self._node_windows[i]))
+                self._unplaced += 1
+            self._node_windows[node].append(ref)
+        self._window = []
+
+        per_node = self._ranks_per_node * self.refs_per_rank_batch
+        if any(len(window) < per_node for window in self._node_windows):
+            return None
+
+        rank_batches: List[List[SampleRef]] = [[] for _ in range(self.dp_size)]
+        for node in range(self._nodes):
+            taken = self._node_windows[node][:per_node]
+            self._node_windows[node] = self._node_windows[node][per_node:]
+            base = node * self._ranks_per_node
+            for index, ref in enumerate(taken):
+                rank_batches[base + index % self._ranks_per_node].append(ref)
+        return rank_batches
 
     def _finish(self) -> None:
         # The dispatch loop only opens an optimizer window once its whole
