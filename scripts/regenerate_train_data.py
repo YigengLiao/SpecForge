@@ -72,6 +72,48 @@ def set_skipped(data: Any, error: str) -> Dict[str, Any]:
     return data
 
 
+def _truncated_payload(message):
+    """Everything the cut-off turn produced: answer text and/or thinking text.
+
+    A truncation mid-thinking leaves `content` empty with all the output in
+    `reasoning_content`, so returning only `content` loses the whole generation.
+    `reasoning_content` is not in the base OpenAI schema -- read it the same way
+    upstream does, attribute first then model_extra.
+    """
+    content = getattr(message, "content", None)
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning is None:
+        extra = getattr(message, "model_extra", None)
+        if isinstance(extra, dict):
+            reasoning = extra.get("reasoning_content")
+    return {"content": content or "", "reasoning_content": reasoning or ""}
+
+
+def set_truncated(data, error: str, partial_text, turn_index, usage, prefix=None):
+    """Mark a record cut off by the server's context, keeping what was generated.
+
+    Unlike set_skipped this preserves the partial assistant text so a later run
+    at a higher ceiling -- or a consumer willing to accept truncated answers --
+    can use it instead of regenerating from nothing.
+    """
+    if not isinstance(data, dict):
+        return {"status": "truncated", "error": error, "data": data}
+    data["status"] = "truncated"
+    data["error"] = error
+    data["truncated_text"] = partial_text
+    data["truncated_at_turn"] = turn_index
+    # Turns finished before the cut-off live only in the caller's local list, so a
+    # mid-loop return would discard them.
+    if prefix is not None:
+        data["truncated_prefix"] = prefix
+    if usage is not None:
+        data["truncated_usage"] = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+        }
+    return data
+
+
 def count_lines(path: str) -> int:
     with open(path, encoding="utf-8") as handle:
         return sum(1 for _ in handle)
@@ -250,6 +292,8 @@ def build_query_kwargs(args, messages, max_tokens=None):
         temperature=args.temperature,
         stream=False,
     )
+    # Left out when unset so the server sizes it per request. An explicit value caps
+    # the input as well, and multi-turn regeneration grows the input as it proceeds.
     if effective_max_tokens is not None:
         query_kwargs["max_tokens"] = effective_max_tokens
     if args.top_p is not None:
@@ -314,14 +358,37 @@ def call_sglang(
                 data["error"] = str(e)
                 return data
 
+            # A turn the context cut off goes to _truncated.jsonl with its partial text
+            # and the turns already completed. Dropping it whole was the earlier rule, on
+            # the grounds that a cut answer teaches the draft to stop mid-sentence; at
+            # data.max_length the trainer truncates long rows anyway, so a row without a
+            # terminator is the norm rather than something this branch introduces.
+            #
+            # Two signals, deliberately: finish_reason is the server telling us it
+            # truncated, which needs no number and cannot disagree with the server's own
+            # context; --max-total-tokens is the explicit ceiling, useful when it is set
+            # BELOW the context to keep only shorter conversations.
+            #
+            # max_tokens is not None only for main()'s server probe, which asks for a
+            # single token and therefore always comes back "length". Upstream's own
+            # reasoning checks skip that call the same way.
+            #
+            # "[budget]" prefixes both messages on purpose: run_stage_a.sh greps the
+            # skipped log for it to report how many records went this way. Keep the two
+            # in step.
             if max_tokens is None:
                 finish_reason = resp.choices[0].finish_reason
                 if finish_reason != "stop":
-                    return set_skipped(
+                    return set_truncated(
                         data,
                         f"[budget] incomplete generation: finish_reason="
                         f"{finish_reason!r} instead of 'stop', so this turn was cut off "
-                        f"rather than finished; discarding the whole conversation",
+                        f"rather than finished; the partial text is kept in "
+                        f"truncated_text",
+                        _truncated_payload(resp.choices[0].message),
+                        len(regenerated_messages) - 1,
+                        getattr(resp, "usage", None),
+                        list(regenerated_messages),
                     )
                 if args.max_total_tokens is not None:
                     usage = getattr(resp, "usage", None)
@@ -427,6 +494,7 @@ def main():
     skip_lines = 0
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
     skipped_file_path = args.output_file_path.replace(".jsonl", "_skipped.jsonl")
+    truncated_file_path = args.output_file_path.replace(".jsonl", "_truncated.jsonl")
 
     if args.resume and os.path.exists(args.output_file_path):
         existing_success = count_lines(args.output_file_path)
@@ -487,6 +555,7 @@ def main():
     success_samples = 0
     error_samples = 0
     skipped_samples = 0
+    truncated_samples = 0
     submitted_samples = 0
 
     # Create progress bar
@@ -495,6 +564,7 @@ def main():
         open(args.output_file_path, file_mode) as output_file_handle,
         open(error_file_path, file_mode) as error_file_handle,
         open(skipped_file_path, file_mode, encoding="utf-8") as skipped_file_handle,
+        open(truncated_file_path, file_mode, encoding="utf-8") as truncated_file_handle,
     ):
         executor = ThreadPoolExecutor(
             max_workers=args.concurrency * len(valid_server_addresses)
@@ -543,6 +613,11 @@ def main():
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
                             )
                             error_samples += 1
+                        elif regen_data["status"] == "truncated":
+                            truncated_file_handle.write(
+                                json.dumps(regen_data, ensure_ascii=False) + "\n"
+                            )
+                            truncated_samples += 1
                         elif regen_data["status"] == "skipped":
                             skipped_file_handle.write(
                                 json.dumps(regen_data, ensure_ascii=False) + "\n"
@@ -588,6 +663,11 @@ def main():
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
                     )
                     error_samples += 1
+                elif regen_data["status"] == "truncated":
+                    truncated_file_handle.write(
+                        json.dumps(regen_data, ensure_ascii=False) + "\n"
+                    )
+                    truncated_samples += 1
                 elif regen_data["status"] == "skipped":
                     skipped_file_handle.write(
                         json.dumps(regen_data, ensure_ascii=False) + "\n"
@@ -633,7 +713,8 @@ def main():
     else:
         print(
             f"\nProcessing completed! {success_samples} samples regenerated, "
-            f"{error_samples} samples failed, {skipped_samples} samples skipped."
+            f"{error_samples} samples failed, {skipped_samples} samples skipped, "
+            f"{truncated_samples} samples truncated."
         )
 
 

@@ -27,7 +27,15 @@ def validate_conversation(
             return f"message {index} must be an object"
         role = message.get("role")
         content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
+        # A generation cut mid-thought has empty content but real reasoning_content,
+        # which the parser masks correctly. content stays a str: callers index it.
+        reasoning = message.get("reasoning_content")
+        thinking_only = (
+            role == "assistant"
+            and isinstance(reasoning, str)
+            and bool(reasoning.strip())
+        )
+        if not isinstance(content, str) or (not content.strip() and not thinking_only):
             if error_style == "regeneration":
                 return (
                     f"Invalid message content at position {index}: "
