@@ -1460,6 +1460,19 @@ def build_disagg_online_consumer(
                         "online consumer resume requires a durable metadata store; "
                         "use metadata_db_path/SQLite rather than an in-memory ledger"
                     )
+                checkpoint_step = _checkpoint_global_step(resume_from)
+                # The marker advances every step and checkpoints land every
+                # save_interval, so only a rewind makes them describe one boundary.
+                rewound = store.rewind_to_step(checkpoint_step)
+                if rewound["acks_dropped"] or rewound["refs_dropped"]:
+                    # `logger` here is the caller's metrics callback, not this module's.
+                    logging.getLogger(__name__).info(
+                        "rewound ledger to checkpoint step %d: undid %d acks and "
+                        "dropped %d refs whose features died with the feature store",
+                        checkpoint_step,
+                        rewound["acks_dropped"],
+                        rewound["refs_dropped"],
+                    )
                 reconciled = controller.reconcile_on_restart(feature_store)
                 # The fresh authority adopted every optimizer-durable committed
                 # ref before aborting it. Resolve any lease-deferred remote
@@ -1467,7 +1480,6 @@ def build_disagg_online_consumer(
                 # every rank, rather than carrying a hidden leak into training.
                 drain_feature_store_removals(feature_store)
                 marker_step = reconciled["global_step"]
-                checkpoint_step = _checkpoint_global_step(resume_from)
                 if marker_step is not None and not reconciled["optimizer_durable"]:
                     raise RuntimeError(
                         f"durable marker at global_step={marker_step} is not marked "
@@ -1483,9 +1495,9 @@ def build_disagg_online_consumer(
                     )
                     raise RuntimeError(
                         f"durable marker global_step={marker_step} is {direction} "
-                        f"checkpoint {resume_from!r} global_step={checkpoint_step}; "
-                        "the retained ack set and restored weights do not describe "
-                        "the same optimizer boundary"
+                        f"checkpoint {resume_from!r} global_step={checkpoint_step} "
+                        "even after rewinding; the retained ack set and restored "
+                        "weights do not describe the same optimizer boundary"
                     )
                 skip_ids = set(reconciled["released"])
                 requeued_ids = set(reconciled["requeued"])
