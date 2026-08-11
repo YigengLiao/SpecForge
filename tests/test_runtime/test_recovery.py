@@ -3,6 +3,7 @@
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -84,6 +85,96 @@ class TestDurableRecovery(unittest.TestCase):
         replay = restarted.sample_queue.get(3)
         self.assertEqual([ref.sample_id for ref in replay], ["s2"])
         reopened.close()
+
+    def test_rewind_undoes_acks_above_the_step_and_drops_their_refs(self):
+        store = SQLiteMetadataStore(self.path)
+        controller = DataFlowController("run0", metadata_store=store)
+        controller.commit_samples("producer", [_ref("s0"), _ref("s1"), _ref("s2")])
+        store.record_train_ack(["s0"], global_step=1, optimizer_durable=True)
+        store.record_train_ack(["s1"], global_step=2, optimizer_durable=True)
+
+        report = store.rewind_to_step(1)
+
+        self.assertEqual(report, {"acks_dropped": 1, "refs_dropped": 2})
+        marker = store.durable_marker()
+        self.assertEqual(marker["global_step"], 1)
+        self.assertTrue(marker["optimizer_durable"])
+        self.assertEqual(marker["acked"], {"s0"})
+        # What survives is exactly what step 1's checkpoint had trained; s1 and s2 are
+        # left for the producer to mint, so no ref outlives the features behind it.
+        self.assertEqual(store.all_committed_ids(), ["s0"])
+        store.close()
+
+    def test_rewind_to_the_current_step_changes_nothing(self):
+        store = SQLiteMetadataStore(self.path)
+        controller = DataFlowController("run0", metadata_store=store)
+        controller.commit_samples("producer", [_ref("s0")])
+        store.record_train_ack(["s0"], global_step=1, optimizer_durable=True)
+
+        self.assertEqual(
+            store.rewind_to_step(1), {"acks_dropped": 0, "refs_dropped": 0}
+        )
+        self.assertEqual(store.durable_marker()["acked"], {"s0"})
+        self.assertEqual(store.all_committed_ids(), ["s0"])
+        store.close()
+
+    def test_resume_after_rewind_reports_the_checkpoint_boundary(self):
+        store = SQLiteMetadataStore(self.path)
+        controller = DataFlowController("run0", metadata_store=store)
+        controller.commit_samples("producer", [_ref("s0"), _ref("s1")])
+        store.record_train_ack(["s0"], global_step=1, optimizer_durable=True)
+        store.record_train_ack(["s1"], global_step=2, optimizer_durable=True)
+        store.close()
+
+        reopened = SQLiteMetadataStore(self.path)
+        reopened.rewind_to_step(1)
+        restarted = DataFlowController("run0", metadata_store=reopened)
+        report = restarted.reconcile_on_restart(_RecordingFeatureStore())
+
+        self.assertEqual(report["global_step"], 1)
+        self.assertEqual(report["released"], ["s0"])
+        self.assertEqual(report["requeued"], [])
+        reopened.close()
+
+    def test_legacy_ledger_dates_its_acks_from_the_batch_invariant(self):
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE acked (sample_id TEXT PRIMARY KEY)")
+        legacy.execute("CREATE TABLE marker (k TEXT, v TEXT)")
+        legacy.executemany(
+            "INSERT INTO acked (sample_id) VALUES (?)",
+            [(f"s{i}",) for i in range(6)],
+        )
+        legacy.execute("INSERT INTO marker (k, v) VALUES ('global_step', '3')")
+        legacy.commit()
+        legacy.close()
+
+        store = SQLiteMetadataStore(self.path)  # migrates on open
+
+        dated = dict(
+            store._conn.execute("SELECT sample_id, step FROM acked").fetchall()
+        )
+        self.assertEqual(
+            dated, {"s0": 1, "s1": 1, "s2": 2, "s3": 2, "s4": 3, "s5": 3}
+        )
+        store.close()
+
+    def test_rewind_refuses_a_ledger_whose_acks_carry_no_step(self):
+        legacy = sqlite3.connect(self.path)
+        legacy.execute("CREATE TABLE acked (sample_id TEXT PRIMARY KEY)")
+        legacy.execute("CREATE TABLE marker (k TEXT, v TEXT)")
+        # 5 acks against step 3 divides unevenly, so no batch size explains them.
+        legacy.executemany(
+            "INSERT INTO acked (sample_id) VALUES (?)",
+            [(f"s{i}",) for i in range(5)],
+        )
+        legacy.execute("INSERT INTO marker (k, v) VALUES ('global_step', '3')")
+        legacy.commit()
+        legacy.close()
+
+        store = SQLiteMetadataStore(self.path)
+        with self.assertRaisesRegex(ValueError, "carry no step"):
+            store.rewind_to_step(1)
+        store.close()
 
 
 if __name__ == "__main__":

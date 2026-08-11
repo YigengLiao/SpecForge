@@ -153,21 +153,36 @@ class TestSharedPlaneConsumerResume(unittest.TestCase):
         self.assertTrue(captured["ref_source"]["prepositioned"])
         self.assertTrue(captured["ref_source"]["defer_ack_until_durable"])
 
-    def test_crash_after_ack_skips_durable_ref_and_requeues_tail(self):
+    def test_crash_after_ack_skips_durable_ref_and_remints_tail(self):
         self._seed_ledger(acked=("s0",), step=1)
         checkpoint = self._checkpoint(1)
 
         _trainer, _captured, distributor = self._build(resume_from=checkpoint)
 
+        # The rewind leaves the ledger as step 1's checkpoint saw it, so the untrained
+        # tail is minted again rather than requeued behind a ref that may resolve to nothing.
         self.assertEqual(distributor.kwargs["skip_ids"], {"s0"})
-        self.assertEqual(distributor.kwargs["requeued_ids"], {"s1"})
+        self.assertEqual(distributor.kwargs["requeued_ids"], set())
         self.assertEqual([item[0] for item in self.features.aborted], ["s0"])
 
-    def test_marker_ahead_of_checkpoint_is_rejected(self):
+    def test_marker_ahead_of_checkpoint_is_rewound_to_it(self):
         self._seed_ledger(acked=("s0",), step=2)
         checkpoint = self._checkpoint(1)
 
-        with self.assertRaisesRegex(RuntimeError, "ahead of.*checkpoint"):
+        _trainer, _captured, distributor = self._build(resume_from=checkpoint)
+
+        # Step 2's ack belongs to a step this checkpoint discards and the checkpoint
+        # predates both samples, so the rewind empties the ledger and both are reminted.
+        self.assertEqual(distributor.kwargs["skip_ids"], set())
+        self.assertEqual(distributor.kwargs["requeued_ids"], set())
+
+    def test_marker_behind_the_checkpoint_is_still_rejected(self):
+        # Rewinding only moves the boundary down. A ledger that never acked the steps
+        # the weights contain would otherwise be advanced into agreement, hiding it.
+        self._seed_ledger(acked=("s0",), step=1)
+        checkpoint = self._checkpoint(2)
+
+        with self.assertRaisesRegex(RuntimeError, "behind.*checkpoint"):
             self._build(resume_from=checkpoint)
 
     def test_fresh_attempt_rejects_nonempty_ledger(self):

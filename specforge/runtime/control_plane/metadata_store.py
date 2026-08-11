@@ -71,6 +71,10 @@ class MetadataStore(abc.ABC):
     def durable_marker(self) -> Dict[str, Any]:
         """{acked: set[str], global_step: int|None, optimizer_durable: bool}."""
 
+    def rewind_to_step(self, step: int) -> Dict[str, int]:
+        """Undo acks above ``step``. A store with no durable state has none to undo."""
+        return {"acks_dropped": 0, "refs_dropped": 0}
+
     # NOTE: a weight-version registry (put/latest/count) is not yet implemented;
     # it belongs with the rest of the published-weight lifecycle.
 
@@ -193,12 +197,106 @@ class SQLiteMetadataStore(MetadataStore):
                 "(sample_id TEXT PRIMARY KEY, ref_json TEXT NOT NULL)"
             )
             self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS acked (sample_id TEXT PRIMARY KEY)"
+                "CREATE TABLE IF NOT EXISTS acked "
+                "(sample_id TEXT PRIMARY KEY, step INTEGER)"
             )
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS marker (k TEXT PRIMARY KEY, v TEXT)"
             )
             self._conn.commit()
+            self._migrate_acked_step()
+
+    def _migrate_acked_step(self) -> None:
+        """Add ``step`` to an older acked table and backfill it where provable.
+
+        One global batch is inserted per optimizer step, so a row count that divides
+        the marker step recovers the batch size and rowid order dates every row.
+        Anything else stays NULL, and ``rewind_to_step`` then refuses rather than guess.
+        """
+        with self._lock:
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(acked)")}
+            if "step" not in columns:
+                self._conn.execute("ALTER TABLE acked ADD COLUMN step INTEGER")
+                self._conn.commit()
+            undated = self._conn.execute(
+                "SELECT COUNT(*) FROM acked WHERE step IS NULL"
+            ).fetchone()[0]
+            if not undated:
+                return
+            total = self._conn.execute("SELECT COUNT(*) FROM acked").fetchone()[0]
+            highest = self._conn.execute("SELECT MAX(rowid) FROM acked").fetchone()[0]
+            row = self._conn.execute(
+                "SELECT v FROM marker WHERE k = 'global_step'"
+            ).fetchone()
+            marker_step = json.loads(row[0]) if row and row[0] else None
+            if (
+                not marker_step
+                or undated != total  # a partial backfill is not ours to interpret
+                or highest != total  # deleted rows break the rowid-to-step mapping
+                or total % marker_step
+            ):
+                return
+            batch = total // marker_step
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    "UPDATE acked SET step = (rowid + ? - 1) / ?", (batch, batch)
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+    def rewind_to_step(self, step: int) -> Dict[str, int]:
+        """Leave the ledger describing the instant ``step``'s checkpoint was written.
+
+        Acks above ``step`` are undone and every ref left without one is dropped, so
+        committed and acked coincide and no ref outlives its features (a durable ack
+        frees them). Re-minting the untrained tail costs one in-flight quantum.
+        """
+        step = int(step)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT v FROM marker WHERE k = 'global_step'"
+            ).fetchone()
+            current = json.loads(row[0]) if row and row[0] else None
+            # Only ever move down: advancing a marker that lost acks the weights hold
+            # would claim those samples were trained and bury the inconsistency.
+            if current is None or current < step:
+                return {"acks_dropped": 0, "refs_dropped": 0}
+            undated = self._conn.execute(
+                "SELECT COUNT(*) FROM acked WHERE step IS NULL"
+            ).fetchone()[0]
+            if undated:
+                raise ValueError(
+                    f"cannot rewind to step {step}: {undated} acks carry no step, so "
+                    "the acks this checkpoint discards cannot be identified"
+                )
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                acks = self._conn.execute(
+                    "DELETE FROM acked WHERE step > ?", (step,)
+                ).rowcount
+                # Undoing the acks first leaves their refs unacked too, so one sweep
+                # covers both them and the tail that was never trained.
+                refs = self._conn.execute(
+                    "DELETE FROM committed WHERE sample_id NOT IN "
+                    "(SELECT sample_id FROM acked)"
+                ).rowcount
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO marker (k, v) VALUES ('global_step', ?)",
+                    (json.dumps(step),),
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO marker (k, v) VALUES "
+                    "('optimizer_durable', ?)",
+                    (json.dumps(True),),
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return {"acks_dropped": acks, "refs_dropped": refs}
 
     def commit_sample(self, ref: SampleRef) -> bool:
         return self.commit_samples([ref])[0]
@@ -262,9 +360,11 @@ class SQLiteMetadataStore(MetadataStore):
     ) -> None:
         # ONE transaction commits ack ids and the optimizer marker together.
         with self._lock:
+            # Dating each ack is what lets a resume undo exactly the steps its
+            # checkpoint discards, instead of demanding the run stop on a boundary.
             self._conn.executemany(
-                "INSERT OR IGNORE INTO acked (sample_id) VALUES (?)",
-                [(s,) for s in sample_ids],
+                "INSERT OR IGNORE INTO acked (sample_id, step) VALUES (?, ?)",
+                [(s, global_step) for s in sample_ids],
             )
             if global_step is not None:
                 self._conn.execute(
